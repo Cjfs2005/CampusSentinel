@@ -10,6 +10,7 @@ from pyrad.dictionary import Dictionary
 import pyrad.packet
 import logging
 from threading import Lock
+import json
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
@@ -49,14 +50,17 @@ def install_auth_flow(dpid, in_port, src_ip, src_mac):
     flow = {
         "switch": dpid,
         "name": flow_name,
-        "table": "1",
-        "priority": str(FLOW_PRIORITY),
-        "ipv4_src": src_ip,
-        "eth_src": src_mac,
-        "in_port": str(in_port),
-        "hard_timeout": str(SESSION_HOURS * 3600),
+        "priority": FLOW_PRIORITY,
         "active": "true",
-        "actions": f"mod_vlan_vid={VLAN_AUTH},goto_table=2"
+        "eth_type": "0x0800",
+        "ipv4_src": src_ip,
+        "in_port": in_port,
+        "eth_src": src_mac,
+        "table": 1,
+        "hard_timeout": SESSION_HOURS * 3600,
+        #"instruction_apply_actions": "push_vlan=0x8100,set_field=eth_vlan_vid->0x1064",
+        "actions": "push_vlan=0x8100,set_vlan_vid=0x0064",
+        "instruction_goto_table": "2"
     }
     try:
         r = requests.post(FLOODLIGHT_URL, json=flow, timeout=5)
@@ -64,22 +68,28 @@ def install_auth_flow(dpid, in_port, src_ip, src_mac):
             logging.info(f"✓ Flow instalado: {flow_name}")
             return flow_name
         else:
-            logging.error(f"✗ Floodlight respondió con código {r.status_code}")
+            logging.error(f"✗ Floodlight respondió con código {r.status_code}: {r.text}")
     except Exception as e:
         logging.error(f"✗ Error instalando flow: {e}")
     return None
 
-def delete_flow(flow_name):
-    if not flow_name:
+def delete_flow(flow_name, dpid):
+    if not flow_name or not dpid:
+        logging.warning(f"✗ delete_flow recibido sin flow_name o dpid")
         return
+
+    url = FLOODLIGHT_URL
+    data = {"name": flow_name, "switch": dpid}
+    headers = {'Content-Type': 'application/json'}
+
     try:
-        resp = requests.delete(f"{FLOODLIGHT_URL}/{flow_name}", timeout=5)
-        if resp.status_code == 200:
+        r = requests.delete(url, data=json.dumps(data), headers=headers, timeout=5)
+        if r.status_code == 200:
             logging.info(f"✓ Flow eliminado: {flow_name}")
         else:
-            logging.warning(f"⚠ Error eliminando flow: código {resp.status_code}")
+            logging.warning(f"⚠ Error eliminando flow {flow_name}: {r.status_code} {r.text}")
     except Exception as e:
-        logging.error(f"✗ Error eliminando flow: {e}")
+        logging.error(f"✗ Error eliminando flow {flow_name}: {e}")
 
 # ========= ENDPOINT: RECIBE PACKET-IN DE FLOODLIGHT =========
 @app.route('/packetin', methods=['POST'])
@@ -94,7 +104,6 @@ def packetin():
 
     cleanup_pending_clients()
 
-    # Verificar si ya está autenticado
     conn = get_db()
     cur = conn.cursor(dictionary=True)
     cur.execute("""
@@ -111,7 +120,6 @@ def packetin():
             "user": user['username']
         })
 
-    # Guardar info temporalmente
     with pending_lock:
         pending_clients[ip] = {
             'mac': mac,
@@ -193,14 +201,10 @@ def login():
 
     logging.info(f"← Login: {email} desde {client['ip']}")
 
-    # Autenticación RADIUS con pyrad (build Access-Request)
     try:
         req = radius_client.CreateAuthPacket(code=pyrad.packet.AccessRequest)
-        # Atributos obligatorios
         req["User-Name"] = email
-        # NAS-IP-Address o NAS-Identifier (opcional pero recomendado)
         req["NAS-Identifier"] = "campus-sentinel"
-        # Encriptar contraseña para Request
         req["User-Password"] = req.PwCrypt(password)
         reply = radius_client.SendPacket(req)
     except Exception as e:
@@ -211,7 +215,6 @@ def login():
         logging.warning(f"✗ Login fallido: {email} - RADIUS code {reply.code}")
         return jsonify({"error": "Credenciales inválidas"}), 401
 
-    # Autenticación exitosa: instalar flow y guardar sesión
     token = str(uuid.uuid4())
     expiry = datetime.utcnow() + timedelta(hours=SESSION_HOURS)
 
@@ -254,7 +257,7 @@ def login():
         "user": email
     })
 
-# ========= LOGOUT, GUEST y STATUS (idénticos a tu versión) =========
+# ========= GUEST =========
 @app.route('/api/guest', methods=['POST'])
 def guest():
     data = request.json
@@ -298,17 +301,23 @@ def guest():
         "expires_in": SESSION_HOURS * 3600
     })
 
+# ========= LOGOUT =========
 @app.route('/api/logout', methods=['POST'])
 def logout():
     token = request.json.get('token')
 
     conn = get_db()
     cur = conn.cursor(dictionary=True)
-    cur.execute("SELECT flow_name, username FROM User WHERE session_token=%s", (token,))
+    # Ahora traemos flow_name y current_dpid
+    cur.execute("""
+        SELECT flow_name, current_dpid, username 
+        FROM User 
+        WHERE session_token=%s
+    """, (token,))
     row = cur.fetchone()
 
     if row:
-        delete_flow(row['flow_name'])
+        delete_flow(row['flow_name'], dpid=row['current_dpid'])
         logging.info(f"✓ Logout: {row['username']}")
     else:
         logging.warning(f"⚠ Token no encontrado: {token}")
@@ -322,6 +331,7 @@ def logout():
 
     return jsonify({"success": True})
 
+# ========= STATUS =========
 @app.route('/api/status', methods=['GET'])
 def status():
     return jsonify({
