@@ -12,6 +12,9 @@ CREATE TABLE `User` (
   `current_dpid` VARCHAR(45) NULL,
   `session_active` BOOLEAN NOT NULL DEFAULT FALSE,
   `session_token` VARCHAR(100) NULL,
+  `session_expiry` DATETIME NULL,
+  `flow_name` VARCHAR(255) NULL,
+  `is_guest` BOOLEAN NULL DEFAULT FALSE,
   PRIMARY KEY (`idUser`),
   UNIQUE INDEX `username_UNIQUE` (`username` ASC)
 ) ENGINE = InnoDB;
